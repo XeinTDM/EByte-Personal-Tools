@@ -1,176 +1,231 @@
-package AntiVm
+package antivm
 
 import (
-	"bytes"
-	"io/ioutil"
-	"log"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
-	"syscall"
+    "errors"
+    "fmt"
+    "os"
+    "strings"
+    "syscall"
+    "unsafe"
 )
 
 func CheckAndExit() {
-	if sysmonRunning := CheckForSysmon(); sysmonRunning {
-		log.Fatalf("VM detection failed: Sysmon is running")
-	}
-	if kvmDetected, err := CheckForKVM(); kvmDetected || err != nil {
-		log.Fatalf("VM detection failed: KVM detected or error occurred: %v", err)
-	}
-
-	if smallScreen, err := IsScreenSmall(); smallScreen || err != nil {
-		log.Fatalf("VM detection failed: Small screen size or error occurred: %v", err)
-	}
-
-	if qemuDetected, err := CheckForQEMU(); qemuDetected || err != nil {
-		log.Fatalf("VM detection failed: QEMU detected or error occurred: %v", err)
-	}
-
-	if taskCheckFailed, err := TaskCheck(); taskCheckFailed || err != nil {
-		log.Fatalf("VM detection failed: Suspicious task activity or error occurred: %v", err)
-	}
-
-	if blacklistedNameDetected := CheckForBlacklistedNames(); blacklistedNameDetected {
-		log.Fatalf("VM detection failed: Blacklisted username detected")
-	}
-
-	if vmArtifactsDetected := VMArtifactsDetect(); vmArtifactsDetected {
-		log.Fatalf("VM detection failed: VM-related artifacts detected")
-	}
-
+    if isVM, err := IsVirtualMachine(); err != nil {
+        fmt.Printf("Error during VM detection: %v\n", err)
+        os.Exit(1)
+    } else if isVM {
+        fmt.Println("Virtual machine environment detected. Exiting.")
+        os.Exit(1)
+    }
 }
 
-func CheckForKVM() (bool, error) {
-	badDrivers := []string{"balloon.sys", "netkvm.sys", "vioinput", "viofs.sys", "vioser.sys"}
-	systemRoot := os.Getenv("SystemRoot")
-
-	for _, driver := range badDrivers {
-		matches, err := filepath.Glob(filepath.Join(systemRoot, "System32", driver))
-		if err != nil {
-			log.Printf("Error accessing system files for %s: %v", driver, err)
-			continue
-		}
-		if len(matches) > 0 {
-			return true, nil
-		}
-	}
-	return false, nil
+func IsVirtualMachine() (bool, error) {
+    if isHypervisorPresent() {
+        return true, nil
+    }
+    if isScreenResolutionSuspicious() {
+        return true, nil
+    }
+    if hasBlacklistedProcesses() {
+        return true, nil
+    }
+    if hasBlacklistedFiles() {
+        return true, nil
+    }
+    if hasBlacklistedMAC() {
+        return true, nil
+    }
+    if hasBlacklistedRegistryKeys() {
+        return true, nil
+    }
+    return false, nil
 }
 
-func IsScreenSmall() (bool, error) {
-	getSystemMetrics := syscall.NewLazyDLL("user32.dll").NewProc("GetSystemMetrics")
-	width, _, _ := getSystemMetrics.Call(0)
-	height, _, _ := getSystemMetrics.Call(1)
+// Using the CPUID instruction.
+func isHypervisorPresent() bool {
+    eax := uint32(1)
+    ecx := uint32(0)
 
-	return width < 800 || height < 600, nil
+    _, _, ecx, _ = cpuid(eax, ecx)
+    hypervisorPresent := ecx&(1<<31) != 0
+
+    return hypervisorPresent
 }
 
-func CheckForQEMU() (bool, error) {
-	qemuDrivers := []string{"qemu-ga", "qemuwmi"}
-	system32Path := filepath.Join(os.Getenv("SystemRoot"), "System32")
-
-	files, err := ioutil.ReadDir(system32Path)
-	if err != nil {
-		return false, err
-	}
-
-	for _, file := range files {
-		for _, driver := range qemuDrivers {
-			if strings.Contains(file.Name(), driver) {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
+// Executes the CPUID instruction with the given EAX and ECX values.
+func cpuid(eax, ecx uint32) (a, b, c, d uint32) {
+    asm := syscall.NewLazyDLL("kernel32.dll").NewProc("IsProcessorFeaturePresent")
+    var info [4]uint32
+    _, _, _ = asm.Call(uintptr(unsafe.Pointer(&eax)), uintptr(unsafe.Pointer(&ecx)), uintptr(unsafe.Pointer(&info)))
+    return info[0], info[1], info[2], info[3]
 }
 
-func TaskCheck() (bool, error) {
-	cmd := exec.Command("tasklist")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+// Checks if the screen resolution is below typical values.
+func isScreenResolutionSuspicious() bool {
+    user32 := syscall.NewLazyDLL("user32.dll")
+    getSystemMetrics := user32.NewProc("GetSystemMetrics")
 
-	err := cmd.Run()
-	if err != nil {
-		log.Printf("Error running tasklist command: %v", err)
-		return false, err
-	}
+    smCxScreen := 0
+    smCyScreen := 1
 
-	processCounts := make(map[string]int)
-	for _, line := range strings.Split(out.String(), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) > 0 {
-			processName := fields[0]
-			if processName != "svchost.exe" {
-				processCounts[processName]++
-			}
-		}
-	}
+    width, _, _ := getSystemMetrics.Call(uintptr(smCxScreen))
+    height, _, _ := getSystemMetrics.Call(uintptr(smCyScreen))
 
-	for _, count := range processCounts {
-		if count > 60 {
-			return true, nil
-		}
-	}
-	return false, nil
+    if width < 1024 || height < 768 {
+        return true
+    }
+    return false
 }
 
-func CheckForBlacklistedNames() bool {
-	blacklistedNames := []string{
-		"Johnson", "Miller", "malware", "maltest", "CurrentUser", "Sandbox", "virus", "John Doe",
-		"test user", "sand box", "WDAGUtilityAccount", "Bruno", "george", "Harry Johnson",
-	}
-	username := strings.ToLower(os.Getenv("USERNAME"))
+func hasBlacklistedProcesses() bool {
+    blacklistedProcesses := []string{
+        "vboxservice.exe",
+        "vboxtray.exe",
+        "vmtoolsd.exe",
+        "vmwaretray.exe",
+        "vmwareuser.exe",
+        "vmsrvc.exe",
+        "vmusrvc.exe",
+        "prl_cc.exe",
+        "prl_tools.exe",
+        "xenservice.exe",
+    }
 
-	for _, name := range blacklistedNames {
-		if username == strings.ToLower(name) {
-			return true
-		}
-	}
-	return false
+    processes, err := enumerateProcesses()
+    if err != nil {
+        return false
+    }
+
+    for _, proc := range processes {
+        for _, blacklisted := range blacklistedProcesses {
+            if strings.EqualFold(proc, blacklisted) {
+                return true
+            }
+        }
+    }
+    return false
 }
 
-func VMArtifactsDetect() bool {
-	badFiles := []string{"VBoxMouse.sys", "VBoxGuest.sys", "VBoxSF.sys", "VBoxVideo.sys", "vmmouse.sys", "vboxogl.dll"}
-	badDirs := []string{`C:\Program Files\VMware`, `C:\Program Files\oracle\virtualbox guest additions`}
-	system32Path := filepath.Join(os.Getenv("SystemRoot"), "System32")
+// Retrieves a list of running process names.
+func enumerateProcesses() ([]string, error) {
+    var processNames []string
 
-	files, err := ioutil.ReadDir(system32Path)
-	if err != nil {
-		log.Printf("Error accessing System32 folder: %v", err)
-		return false
-	}
+    snapshot, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
+    if err != nil {
+        return nil, err
+    }
+    defer syscall.CloseHandle(snapshot)
 
-	for _, file := range files {
-		fileName := strings.ToLower(file.Name())
-		for _, badFile := range badFiles {
-			if fileName == strings.ToLower(badFile) {
-				return true
-			}
-		}
-	}
+    var entry syscall.ProcessEntry32
+    entry.Size = uint32(unsafe.Sizeof(entry))
 
-	for _, badDir := range badDirs {
-		if _, err := os.Stat(badDir); err == nil {
-			return true
-		}
-	}
+    err = syscall.Process32First(snapshot, &entry)
+    if err != nil {
+        return nil, err
+    }
 
-	return false
+    for {
+        processName := syscall.UTF16ToString(entry.ExeFile[:])
+        processNames = append(processNames, processName)
+        err = syscall.Process32Next(snapshot, &entry)
+        if err != nil {
+            if errors.Is(err, syscall.ERROR_NO_MORE_FILES) {
+                break
+            }
+            return nil, err
+        }
+    }
+    return processNames, nil
 }
 
-func CheckForSysmon() bool {
-	cmd := exec.Command("tasklist")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+func hasBlacklistedFiles() bool {
+    systemRoot := os.Getenv("SystemRoot")
+    if systemRoot == "" {
+        systemRoot = "C:\\Windows"
+    }
 
-	err := cmd.Run()
-	if err != nil {
-		log.Printf("Error running tasklist command: %v", err)
-		return false
-	}
+    blacklistedFiles := []string{
+        "C:\\Windows\\System32\\drivers\\vmmouse.sys",
+        "C:\\Windows\\System32\\drivers\\vmhgfs.sys",
+        "C:\\Windows\\System32\\drivers\\VBoxMouse.sys",
+        "C:\\Windows\\System32\\drivers\\VBoxGuest.sys",
+        "C:\\Windows\\System32\\drivers\\VBoxSF.sys",
+        "C:\\Windows\\System32\\drivers\\VBoxVideo.sys",
+    }
 
-	return strings.Contains(out.String(), "sysmon.exe")
+    for _, filePath := range blacklistedFiles {
+        if fileExists(filePath) {
+            return true
+        }
+    }
+    return false
+}
+
+// Checks if a file exists at the given path.
+func fileExists(path string) bool {
+    _, err := os.Stat(path)
+    return err == nil
+}
+
+func hasBlacklistedMAC() bool {
+    blacklistedMACPrefixes := []string{
+        "00:05:69", // VMware
+        "00:0C:29", // VMware
+        "00:1C:14", // VMware
+        "00:50:56", // VMware
+        "00:15:5D", // Hyper-V
+        "00:03:FF", // Microsoft Virtual PC
+        "00:1C:42", // Parallels
+        "08:00:27", // VirtualBox
+    }
+
+    interfaces, err := getNetworkInterfaces()
+    if err != nil {
+        return false
+    }
+
+    for _, iface := range interfaces {
+        mac := iface.HardwareAddr.String()
+        for _, prefix := range blacklistedMACPrefixes {
+            if strings.HasPrefix(strings.ToUpper(mac), strings.ToUpper(prefix)) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+func getNetworkInterfaces() ([]net.Interface, error) {
+    return net.Interfaces()
+}
+
+func hasBlacklistedRegistryKeys() bool {
+    blacklistedKeys := []string{
+        `HARDWARE\ACPI\DSDT\VBOX__`,
+        `HARDWARE\ACPI\FADT\VBOX__`,
+        `HARDWARE\ACPI\RSDT\VBOX__`,
+        `HARDWARE\ACPI\RSDT\VBOX__`,
+        `SOFTWARE\Oracle\VirtualBox Guest Additions`,
+        `SYSTEM\ControlSet001\Services\VBoxGuest`,
+        `SYSTEM\ControlSet001\Services\VBoxService`,
+        `SYSTEM\ControlSet001\Services\VBoxSF`,
+        `SYSTEM\ControlSet001\Services\VBoxVideo`,
+    }
+
+    for _, keyPath := range blacklistedKeys {
+        if registryKeyExists(syscall.HKEY_LOCAL_MACHINE, keyPath) {
+            return true
+        }
+    }
+    return false
+}
+
+// Checks if a registry key exists.
+func registryKeyExists(root syscall.Handle, path string) bool {
+    key, err := syscall.RegOpenKeyEx(root, syscall.StringToUTF16Ptr(path), 0, syscall.KEY_READ)
+    if err == nil {
+        syscall.RegCloseKey(key)
+        return true
+    }
+    return false
 }
